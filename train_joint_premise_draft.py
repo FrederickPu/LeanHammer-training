@@ -2,13 +2,11 @@
 Joint training of one Qwen backbone on two objectives per batch:
 draft generation (cross-entropy) and premise selection (masked InfoNCE).
 
-The input is used in two modes:
-    draft :  [input] [output] [EOS]   -> CE on the output span (generation)
-    query :  [input] [EMB]            -> last-token hidden state, L2-normalized
-[EMB] marks "embed here", so the same input can be generated (no [EMB]) or embedded.
-Premises carry no [EMB] but are encoded the same way ([premise] -> last token); each
-input is scored against them by cosine similarity and pulled toward its gold premises.
-Data rows are {input, output, premises}; `input` is pre-chat-templated by the caller.
+Each row carries two distinct prompts:
+    retrieval_query : [retrieval_query] [EMB]        -> last-token embedding, L2-normalized
+    draft_query     : [draft_query] [draft] [EOS]    -> CE on the draft span
+Premises are encoded as [premise] -> last token, L2-normalized.
+Data rows are {retrieval_query, draft_query, draft, premises}.
 """
 
 import random, torch
@@ -73,21 +71,21 @@ class Collate:
                         max_length=self.cfg.max_len).input_ids
 
     def __call__(self, batch):
-        """batch: list of B rows {input: str, output: str, premises: list[str]}.
-        q = query (the input), p = premise, d = draft (input + output).
+        """batch: list of B rows {retrieval_query, draft_query, draft, premises}.
 
         Dims:
             B            rows in the batch
             Lq, Lp, Ld   padded length of the q / p / d views
 
         Returns tensors (q, p encoded for embedding; only d is generated):
-            query_ids,   query_mask     (B, Lq)
-            premise_ids, premise_mask   (B, 1+n_neg, Lp)  dim 1: [pos, neg_0, ..., neg_{n-1}]
-            retrieval_mask              (B, B*(1+n_neg))   False = false negative
-            draft_ids,   draft_mask     (B, Ld)   [input][output][EOS]
-            draft_labels                (B, Ld)   output span only (-100 elsewhere)"""
-        ins  = [self.enc(b["input"])  for b in batch]
-        outs = [self.enc(b["output"]) + [self.eos] for b in batch]
+            retrieval_query_ids, retrieval_query_mask  (B, Lq)   [retrieval_query][EMB]
+            premise_ids,         premise_mask          (B, 1+n_neg, Lp)
+            retrieval_mask                             (B, B*(1+n_neg))   False = false negative
+            draft_query_ids,     draft_query_mask      (B, Ld)   [draft_query][draft][EOS]
+            draft_labels                               (B, Ld)   draft span only (-100 elsewhere)"""
+        retrieval_query = [self.enc(b["retrieval_query"]) for b in batch]
+        draft_query     = [self.enc(b["draft_query"])     for b in batch]
+        draft           = [self.enc(b["draft"]) + [self.eos] for b in batch]
         prem_sets = [set(b["premises"]) for b in batch]
 
         B, n_neg = len(batch), self.cfg.n_neg
@@ -112,17 +110,19 @@ class Collate:
                     if prem in prem_sets[i]:            # false negative for query i
                         mask[i, qi * (1 + n_neg) + c] = False
 
-        query_ids = pad([x + [self.emb] for x in ins], self.padid)
-        draft_ids = pad([x + o for x, o in zip(ins, outs)], self.padid)
+        retrieval_query_ids = pad([x + [self.emb] for x in retrieval_query], self.padid)
+        draft_query_ids     = pad([x + o for x, o in zip(draft_query, draft)], self.padid)
         return dict(
-            # input
-            query_ids=query_ids,     query_mask=(query_ids != self.padid).long(),
+            # retrieval query
+            retrieval_query_ids=retrieval_query_ids,
+            retrieval_query_mask=(retrieval_query_ids != self.padid).long(),
             # premise
             premise_ids=premise_ids, premise_mask=(premise_ids != self.padid).long(),
             retrieval_mask=mask,
             # draft
-            draft_ids=draft_ids,     draft_mask=(draft_ids != self.padid).long(),
-            draft_labels=pad([[-100] * len(x) + o for x, o in zip(ins, outs)], -100),
+            draft_query_ids=draft_query_ids,
+            draft_query_mask=(draft_query_ids != self.padid).long(),
+            draft_labels=pad([[-100] * len(x) + o for x, o in zip(draft_query, draft)], -100),
         )
 
 
@@ -133,10 +133,10 @@ class JointTrainer(Trainer):
 
     def compute_loss(self, model, x, return_outputs=False, **kw):
         B, n1, _ = x["premise_ids"].shape
-        q = embed(model, x["query_ids"], x["query_mask"])
+        q = embed(model, x["retrieval_query_ids"], x["retrieval_query_mask"])
         p = embed(model, x["premise_ids"].view(B * n1, -1), x["premise_mask"].view(B * n1, -1))
         contrastive = contrastive_loss(q, p, x["retrieval_mask"], self.cfg.temp)
-        ce = model(input_ids=x["draft_ids"], attention_mask=x["draft_mask"],
+        ce = model(input_ids=x["draft_query_ids"], attention_mask=x["draft_query_mask"],
                    labels=x["draft_labels"]).loss
         loss = ce + self.cfg.lam * contrastive
         return (loss, {"ce": ce, "contrastive": contrastive}) if return_outputs else loss
