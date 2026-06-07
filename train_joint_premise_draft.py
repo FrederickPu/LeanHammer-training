@@ -1,7 +1,7 @@
 """
 Joint training of one Qwen backbone on two objectives per batch:
 draft generation (cross-entropy) and premise selection (masked InfoNCE).
- 
+
 The input is used in two modes:
     draft :  [input] [output] [EOS]   -> CE on the output span (generation)
     query :  [input] [EMB]            -> last-token hidden state, L2-normalized
@@ -24,7 +24,7 @@ class Cfg:
     model: str = "Qwen/Qwen3.5-TODO"
     temp: float = 0.05      # InfoNCE temperature
     lam: float = 1.0        # weight on the premise loss
-    n_neg: int = 64         # sampled library negatives per batch
+    n_neg: int = 3          # library negatives per query
     max_len: int = 1024
 
 
@@ -43,10 +43,18 @@ def embed(model, ids, mask):
     return F.normalize(h[torch.arange(ids.size(0), device=ids.device), pos], dim=-1)
 
 
-def info_nce(sim, pos):
-    neg = sim.masked_fill(pos, float("-inf"))
-    denom = torch.logaddexp(sim, neg.logsumexp(1, keepdim=True))
-    return (denom - sim)[pos].mean()
+def contrastive_loss(q, p_all, retrieval_mask, temp):
+    """Diagonal CrossEntropy with false-negative masking (matches loss.py).
+
+    q:              (B, H)
+    p_all:          (B*(1+n_neg), H)  row-major: p_all[i*(1+n_neg)] is pos for query i
+    retrieval_mask: (B, B*(1+n_neg))  False where a labelled-negative is actually gold
+    """
+    n1 = p_all.shape[0] // len(q)          # 1 + n_neg
+    scores = q @ p_all.T / temp
+    scores[~retrieval_mask] = float("-inf")
+    labels = torch.arange(len(q), device=q.device) * n1
+    return F.cross_entropy(scores, labels)
 
 
 def pad(seqs, fill):
@@ -70,41 +78,51 @@ class Collate:
 
         Dims:
             B            rows in the batch
-            N            distinct gold premises in the batch + n_neg sampled negatives
             Lq, Lp, Ld   padded length of the q / p / d views
 
-        Returns tensors (q, p are encoded for their embedding; only d is generated):
-            query_ids,   query_mask     (B, Lq)   [input][EMB]
-            premise_ids, premise_mask   (N, Lp)   [premise]
-            pos_mask                    (B, N)    bool: premise j is gold for input i
+        Returns tensors (q, p encoded for embedding; only d is generated):
+            query_ids,   query_mask     (B, Lq)
+            premise_ids, premise_mask   (B, 1+n_neg, Lp)  dim 1: [pos, neg_0, ..., neg_{n-1}]
+            retrieval_mask              (B, B*(1+n_neg))   False = false negative
             draft_ids,   draft_mask     (B, Ld)   [input][output][EOS]
             draft_labels                (B, Ld)   output span only (-100 elsewhere)"""
-        ins = [self.enc(b["input"]) for b in batch]
+        ins  = [self.enc(b["input"])  for b in batch]
         outs = [self.enc(b["output"]) + [self.eos] for b in batch]
         prem_sets = [set(b["premises"]) for b in batch]
 
-        pos_all = set().union(*prem_sets)
-        negs = random.sample([p for p in self.library if p not in pos_all], self.cfg.n_neg)
-        cands = list(pos_all) + negs
-        pos_mask = torch.tensor([[c in s for c in cands] for s in prem_sets])
+        B, n_neg = len(batch), self.cfg.n_neg
+        pos_all  = set().union(*prem_sets)
+        neg_pool = [p for p in self.library if p not in pos_all]
 
-        query = [x + [self.emb] for x in ins]
-        prem = [self.enc(p) for p in cands]
-        draft = [x + o for x, o in zip(ins, outs)]
-        labels = [[-100] * len(x) + o for x, o in zip(ins, outs)]
+        # prem_groups[i] = [pos_i, neg_0_i, ..., neg_{n_neg-1}_i]
+        prem_groups = [[b["premises"][0]] + random.choices(neg_pool, k=n_neg) for b in batch]
 
-        query_ids = pad(query, self.padid)
-        premise_ids = pad(prem, self.padid)
-        draft_ids = pad(draft, self.padid)
+        # Tokenize flat, then reshape to (B, 1+n_neg, L)
+        all_prem_seqs = [self.enc(p) for group in prem_groups for p in group]
+        premise_ids   = pad(all_prem_seqs, self.padid).view(B, 1 + n_neg, -1)
+
+        # retrieval_mask: (B, B*(1+n_neg))
+        # flat_j = qi*(1+n_neg) + c  →  qi-th query's c-th premise (c=0 is its positive)
+        mask = torch.ones(B, B * (1 + n_neg), dtype=torch.bool)
+        for i in range(B):
+            for qi in range(B):
+                for c, prem in enumerate(prem_groups[qi]):
+                    if qi == i and c == 0:              # labeled positive for query i
+                        continue
+                    if prem in prem_sets[i]:            # false negative for query i
+                        mask[i, qi * (1 + n_neg) + c] = False
+
+        query_ids = pad([x + [self.emb] for x in ins], self.padid)
+        draft_ids = pad([x + o for x, o in zip(ins, outs)], self.padid)
         return dict(
             # input
-            query_ids=query_ids, query_mask=(query_ids != self.padid).long(),
+            query_ids=query_ids,     query_mask=(query_ids != self.padid).long(),
             # premise
             premise_ids=premise_ids, premise_mask=(premise_ids != self.padid).long(),
-            pos_mask=pos_mask,
+            retrieval_mask=mask,
             # draft
-            draft_ids=draft_ids, draft_mask=(draft_ids != self.padid).long(),
-            draft_labels=pad(labels, -100),
+            draft_ids=draft_ids,     draft_mask=(draft_ids != self.padid).long(),
+            draft_labels=pad([[-100] * len(x) + o for x, o in zip(ins, outs)], -100),
         )
 
 
@@ -114,10 +132,10 @@ class JointTrainer(Trainer):
         self.cfg = cfg
 
     def compute_loss(self, model, x, return_outputs=False, **kw):
+        B, n1, _ = x["premise_ids"].shape
         q = embed(model, x["query_ids"], x["query_mask"])
-        d = embed(model, x["premise_ids"], x["premise_mask"])
-        sim = q @ d.T / self.cfg.temp
-        contrastive = info_nce(sim, x["pos_mask"])
+        p = embed(model, x["premise_ids"].view(B * n1, -1), x["premise_mask"].view(B * n1, -1))
+        contrastive = contrastive_loss(q, p, x["retrieval_mask"], self.cfg.temp)
         ce = model(input_ids=x["draft_ids"], attention_mask=x["draft_mask"],
                    labels=x["draft_labels"]).loss
         loss = ce + self.cfg.lam * contrastive
