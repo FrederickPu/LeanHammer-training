@@ -5,8 +5,8 @@ Sections
 --------
 1. Helpers
 2. contrastive_loss unit tests  — regression vs loss.py
-3. Collate unit tests           — shapes, mask, draft labels
-4. Integration                  — collate mask -> contrastive_loss; backward; vs repo loss
+3. Collate unit tests           — shapes, gold_mask, draft labels
+4. Integration                  — collate gold_mask -> contrastive_loss; backward; vs repo loss
 """
 
 import random
@@ -51,24 +51,10 @@ def make_loss_fn(temp, B):
     return _RepoLoss(temp, B)
 
 
-def to_col_major(p_row, mask_row, B, n1):
-    """Convert row-major premises/mask to the column-major layout of loss.py.
-
-    Row-major:    p_row[i*n1 + c]        = query i's c-th premise
-    Column-major: p_col[c*B  + i]        = query i's c-th premise
-    mask_row[i, qi*n1 + c] -> mask_col[i, c*B + qi]
-    """
-    p_col = p_row.view(B, n1, -1).permute(1, 0, 2).reshape(B * n1, -1)
-    mask_col = torch.zeros_like(mask_row)
-    for qi in range(B):
-        for c in range(n1):
-            mask_col[:, c * B + qi] = mask_row[:, qi * n1 + c]
-    return p_col, mask_col
-
-
 def make_reps(q, p_col, B, n1, requires_grad=False):
-    """Build the reps list expected by loss.py from column-major premises.
+    """Build the reps list expected by loss.py.
 
+    p_col is in col-major layout: p_col[c*B:(c+1)*B] = c-th premise for each query.
     reps[0] = [q]                  queries     (B, H)
     reps[1] = [p_col[0:B]]         positives   (B, H)
     reps[c] = [p_col[(c-1)*B:c*B]] (c-1)-th negatives
@@ -83,49 +69,70 @@ def make_reps(q, p_col, B, n1, requires_grad=False):
     return reps
 
 
-def _collate(n_neg=1, library=("nA", "nB", "nC", "nD")):
-    return Collate(_Tok(), Cfg(n_neg=n_neg, max_len=512), list(library))
+def gold_to_repo_mask(gold_mask):
+    """Convert gold_mask -> repo_mask for _RepoLoss.calculate_loss.
+
+    gold_mask[i,j]=True: premise j is gold for query i (labeled pos or false neg).
+    repo_mask[i,j]=True: include column j in denominator for query i.
+    Labeled positives (diagonal) are always included; false negatives excluded.
+    """
+    B = gold_mask.shape[0]
+    repo_mask = ~gold_mask.clone()
+    repo_mask[torch.arange(B), torch.arange(B)] = True
+    return repo_mask
+
+
+def _collate(n_neg=1):
+    library = [f"neg{i}" for i in range(40)]   # large enough for any test
+    return Collate(_Tok(), Cfg(n_neg=n_neg, max_len=512), library)
+
+
+def _row(rq, premise, dq="dq", draft="d"):
+    return {"retrieval_query": rq, "premise": premise, "draft_query": dq, "draft": draft}
 
 
 # ── 2. contrastive_loss unit tests ───────────────────────────────────────────
 
 def test_loss_values_no_mask():
-    """Loss values match loss.py with an all-True retrieval mask."""
+    """Loss matches loss.py with diagonal-only gold_mask (no false negatives)."""
     torch.manual_seed(0)
     B, n_neg, H, temp = 4, 2, 16, 0.05
     n1 = 1 + n_neg
 
     q     = F.normalize(torch.randn(B, H), dim=-1)
-    p_row = F.normalize(torch.randn(B * n1, H), dim=-1)
-    mask  = torch.ones(B, B * n1, dtype=torch.bool)
+    p_all = F.normalize(torch.randn(B * n1, H), dim=-1)  # col-major: p_all[0:B]=positives
 
-    our = contrastive_loss(q, p_row, mask, temp)
+    gold_mask = torch.zeros(B, B * n1, dtype=torch.bool)
+    gold_mask[torch.arange(B), torch.arange(B)] = True   # only labeled positives
 
-    p_col, mask_col = to_col_major(p_row, mask, B, n1)
-    fn  = make_loss_fn(temp, B)
-    ref = fn.calculate_loss(make_reps(q, p_col, B, n1), mask_col)
+    our = contrastive_loss(q, p_all, gold_mask, temp)
+
+    # p_all is already col-major so make_reps works directly
+    repo_mask = gold_to_repo_mask(gold_mask)   # all True
+    ref = make_loss_fn(temp, B).calculate_loss(make_reps(q, p_all, B, n1), repo_mask)
 
     assert torch.allclose(our, ref, atol=1e-5), f"ours={our:.6f}  repo={ref:.6f}"
     print(f"PASS test_loss_values_no_mask           loss={our:.6f}")
 
 
 def test_loss_values_with_mask():
-    """Loss values match loss.py with some false negatives masked out."""
+    """Loss matches loss.py when some off-diagonal entries are gold (false negatives)."""
     torch.manual_seed(1)
     B, n_neg, H, temp = 4, 2, 16, 0.05
     n1 = 1 + n_neg
 
     q     = F.normalize(torch.randn(B, H), dim=-1)
-    p_row = F.normalize(torch.randn(B * n1, H), dim=-1)
-    mask  = torch.ones(B, B * n1, dtype=torch.bool)
-    mask[0, 1 * n1 + 0] = False   # query 1's positive is also gold for query 0
-    mask[2, 3 * n1 + 1] = False   # query 3's neg_0 is also gold for query 2
+    p_all = F.normalize(torch.randn(B * n1, H), dim=-1)
 
-    our = contrastive_loss(q, p_row, mask, temp)
+    gold_mask = torch.zeros(B, B * n1, dtype=torch.bool)
+    gold_mask[torch.arange(B), torch.arange(B)] = True
+    gold_mask[0, 1] = True   # query 1's positive is also gold for query 0
+    gold_mask[2, 3] = True   # query 3's positive is also gold for query 2
 
-    p_col, mask_col = to_col_major(p_row, mask, B, n1)
-    fn  = make_loss_fn(temp, B)
-    ref = fn.calculate_loss(make_reps(q, p_col, B, n1), mask_col)
+    our = contrastive_loss(q, p_all, gold_mask, temp)
+
+    repo_mask = gold_to_repo_mask(gold_mask)
+    ref = make_loss_fn(temp, B).calculate_loss(make_reps(q, p_all, B, n1), repo_mask)
 
     assert torch.allclose(our, ref, atol=1e-5), f"ours={our:.6f}  repo={ref:.6f}"
     print(f"PASS test_loss_values_with_mask         loss={our:.6f}")
@@ -171,60 +178,52 @@ def test_cached_gradients_match_reference():
 def test_collate_output_shapes():
     B, n_neg = 3, 2
     col = _collate(n_neg=n_neg)
-    batch = [
-        {"retrieval_query": f"rq{i}", "draft_query": f"dq{i}",
-         "draft": f"out{i}", "premises": [f"p{i}"]}
-        for i in range(B)
-    ]
+    batch = [_row(f"rq{i}", f"p{i}", f"dq{i}", f"out{i}") for i in range(B)]
     random.seed(0)
     out = col(batch)
-    n1 = 1 + n_neg
-    Lp = out["premise_ids"].shape[2]
+    M = B + n_neg * B   # B positives + n_neg*B negatives
 
     assert out["retrieval_query_ids"].shape[0] == B
-    assert out["premise_ids"].shape == torch.Size([B, n1, Lp])
-    assert out["retrieval_mask"].shape == torch.Size([B, B * n1])
+    assert out["premise_ids"].shape[0] == M           # flat (M, L), not (B, n1, L)
+    assert out["gold_mask"].shape == torch.Size([B, M])
     assert out["draft_labels"].shape == out["draft_query_ids"].shape
     print("PASS test_collate_output_shapes")
 
 
-def test_collate_mask_shared_positive():
-    """mask[i, qi*n1] is False when qi's positive is also gold for query i."""
+def test_collate_mask_shared_goal():
+    """Rows with the same retrieval_query mark each other's positives as gold (false neg)."""
     col = _collate(n_neg=1)
-    batch = [
-        {"retrieval_query": "rq0", "draft_query": "dq0", "draft": "out0", "premises": ["shared"]},
-        {"retrieval_query": "rq1", "draft_query": "dq1", "draft": "out1", "premises": ["shared"]},
-    ]
+    batch = [_row("same_goal", "prem0"), _row("same_goal", "prem1")]
     random.seed(0)
-    mask = col(batch)["retrieval_mask"]   # (2, 4),  n1=2
-    n1 = 2
+    gold_mask = col(batch)["gold_mask"]   # (2, M)
 
-    assert not mask[0, 1 * n1 + 0].item(), "row 1's positive should be masked for row 0"
-    assert not mask[1, 0 * n1 + 0].item(), "row 0's positive should be masked for row 1"
-    assert mask[0, 0 * n1 + 0].item(),     "own positive must be unmasked"
-    assert mask[1, 1 * n1 + 0].item(),     "own positive must be unmasked"
-    assert mask[0, 0 * n1 + 1].item(),     "own negative must be unmasked"
-    assert mask[0, 1 * n1 + 1].item(),     "cross negative must be unmasked"
-    print("PASS test_collate_mask_shared_positive")
+    assert gold_mask[0, 0].item(),  "own positive must be gold"
+    assert gold_mask[1, 1].item(),  "own positive must be gold"
+    assert gold_mask[0, 1].item(),  "row 1's positive must be gold for row 0 (same goal)"
+    assert gold_mask[1, 0].item(),  "row 0's positive must be gold for row 1 (same goal)"
+    # Shared negatives (columns 2+) must not be marked gold
+    assert not gold_mask[0, 2].item(), "shared negative must not be gold"
+    assert not gold_mask[1, 2].item(), "shared negative must not be gold"
+    print("PASS test_collate_mask_shared_goal")
 
 
-def test_collate_mask_no_false_negatives():
-    """When all positives are distinct, retrieval_mask is all True."""
+def test_collate_mask_distinct_goals():
+    """Rows with different retrieval_query have only diagonal gold."""
     col = _collate(n_neg=1)
-    batch = [
-        {"retrieval_query": "rq0", "draft_query": "dq0", "draft": "out0", "premises": ["p0"]},
-        {"retrieval_query": "rq1", "draft_query": "dq1", "draft": "out1", "premises": ["p1"]},
-    ]
+    batch = [_row("goal0", "p0"), _row("goal1", "p1")]
     random.seed(0)
-    mask = col(batch)["retrieval_mask"]
-    assert mask.all().item(), "no shared premises -> mask should be all True"
-    print("PASS test_collate_mask_no_false_negatives")
+    gold_mask = col(batch)["gold_mask"]
+    B, M = gold_mask.shape
+    expected = torch.zeros(B, M, dtype=torch.bool)
+    expected[torch.arange(B), torch.arange(B)] = True
+    assert (gold_mask == expected).all(), "distinct goals -> only diagonal should be gold"
+    print("PASS test_collate_mask_distinct_goals")
 
 
 def test_collate_draft_labels():
     """-100 on the draft_query prefix; actual token ids on the draft span."""
     col = _collate(n_neg=1)
-    batch = [{"retrieval_query": "rq", "draft_query": "Q", "draft": "AB", "premises": ["p"]}]
+    batch = [_row("rq", "p", dq="Q", draft="AB")]
     random.seed(0)
     labels = col(batch)["draft_labels"][0]
     q_len = len([ord(c) % 90 + 10 for c in "Q"])   # 1
@@ -236,7 +235,7 @@ def test_collate_draft_labels():
 def test_collate_retrieval_query_ends_with_emb():
     """retrieval_query_ids last real token is the EMB token (id=2)."""
     col = _collate(n_neg=1)
-    batch = [{"retrieval_query": "hello", "draft_query": "dq", "draft": "out", "premises": ["p"]}]
+    batch = [_row("hello", "p")]
     random.seed(0)
     out  = col(batch)
     ids  = out["retrieval_query_ids"][0]
@@ -249,79 +248,76 @@ def test_collate_retrieval_query_ends_with_emb():
 # ── 4. Integration ────────────────────────────────────────────────────────────
 
 def test_end_to_end_masking_changes_loss():
-    """Collate mask -> contrastive_loss: false-negative masking changes the loss value."""
+    """gold_mask from collator changes loss when rows share the same goal."""
     torch.manual_seed(3)
     B, n_neg, H, temp = 2, 1, 8, 0.05
 
     col = _collate(n_neg=n_neg)
-    batch = [
-        {"retrieval_query": "rq0", "draft_query": "dq0", "draft": "d0", "premises": ["shared"]},
-        {"retrieval_query": "rq1", "draft_query": "dq1", "draft": "d1", "premises": ["shared"]},
-    ]
+    batch = [_row("same_goal", "prem0"), _row("same_goal", "prem1")]
     random.seed(0)
-    mask = col(batch)["retrieval_mask"]   # has False at [0,2] and [1,0]
+    gold_mask = col(batch)["gold_mask"]   # has True at [0,1] and [1,0]
 
+    M = gold_mask.shape[1]
     q     = F.normalize(torch.randn(B, H), dim=-1)
-    p_row = F.normalize(torch.randn(B * (1 + n_neg), H), dim=-1)
+    p_all = F.normalize(torch.randn(M, H), dim=-1)
 
-    loss_masked   = contrastive_loss(q, p_row, mask,                      temp)
-    loss_unmasked = contrastive_loss(q, p_row, torch.ones_like(mask), temp)
+    gold_diag = torch.zeros_like(gold_mask)
+    gold_diag[torch.arange(B), torch.arange(B)] = True
+
+    loss_masked   = contrastive_loss(q, p_all, gold_mask, temp)
+    loss_unmasked = contrastive_loss(q, p_all, gold_diag, temp)
     assert not torch.allclose(loss_masked, loss_unmasked), \
-        "masking should change the loss when premises are shared"
+        "masking should change the loss when goals are shared"
     print("PASS test_end_to_end_masking_changes_loss")
 
 
 def test_end_to_end_gradients_flow():
-    """Gradients flow through contrastive_loss with a collator-produced mask."""
+    """Gradients flow through contrastive_loss with a collator-produced gold_mask."""
     torch.manual_seed(3)
     B, n_neg, H, temp = 2, 1, 8, 0.05
 
     col = _collate(n_neg=n_neg)
-    batch = [
-        {"retrieval_query": "rq0", "draft_query": "dq0", "draft": "d0", "premises": ["shared"]},
-        {"retrieval_query": "rq1", "draft_query": "dq1", "draft": "d1", "premises": ["shared"]},
-    ]
+    batch = [_row("same_goal", "prem0"), _row("same_goal", "prem1")]
     random.seed(0)
-    mask = col(batch)["retrieval_mask"]
+    gold_mask = col(batch)["gold_mask"]
 
+    M = gold_mask.shape[1]
     q_leaf = torch.randn(B, H, requires_grad=True)
-    p_leaf = torch.randn(B * (1 + n_neg), H, requires_grad=True)
-    contrastive_loss(q_leaf, p_leaf, mask, temp).backward()
+    p_leaf = torch.randn(M, H, requires_grad=True)
+    contrastive_loss(q_leaf, p_leaf, gold_mask, temp).backward()
     assert q_leaf.grad is not None and p_leaf.grad is not None
     print("PASS test_end_to_end_gradients_flow")
 
 
 def test_end_to_end_loss_matches_repo():
-    """Collate mask + contrastive_loss == _RepoLoss.calculate_loss (col-major).
+    """Collate gold_mask + contrastive_loss == _RepoLoss.calculate_loss.
 
-    Verifies that the full pipeline — collator-produced mask, row-major premise
-    layout, contrastive_loss — produces the same value as the original repo's
-    loss once the layout is converted to column-major.
+    Verifies the full pipeline end-to-end: collator-produced gold_mask feeds into
+    contrastive_loss and matches the original repo loss after mask conversion.
+    Rows 0 and 2 share the same goal, producing two false negatives in the mask.
     """
     torch.manual_seed(4)
     B, n_neg, H, temp = 3, 2, 16, 0.05
     n1 = 1 + n_neg
 
     col = _collate(n_neg=n_neg)
-    # Row 0 and row 2 share "shared" as their positive -> two false negatives in mask
     batch = [
-        {"retrieval_query": "rq0", "draft_query": "dq0", "draft": "d0",
-         "premises": ["shared", "extra0"]},
-        {"retrieval_query": "rq1", "draft_query": "dq1", "draft": "d1",
-         "premises": ["p1"]},
-        {"retrieval_query": "rq2", "draft_query": "dq2", "draft": "d2",
-         "premises": ["shared", "extra2"]},
+        _row("goal_A", "prem0"),
+        _row("goal_B", "prem1"),
+        _row("goal_A", "prem2"),   # same goal as row 0 -> mutual false negatives
     ]
     random.seed(0)
-    mask = col(batch)["retrieval_mask"]
+    gold_mask = col(batch)["gold_mask"]   # (3, M), M = B*n1 = 9
 
+    M = gold_mask.shape[1]
     q     = F.normalize(torch.randn(B, H), dim=-1)
-    p_row = F.normalize(torch.randn(B * n1, H), dim=-1)
+    p_all = F.normalize(torch.randn(M, H), dim=-1)
 
-    our = contrastive_loss(q, p_row, mask, temp)
+    our = contrastive_loss(q, p_all, gold_mask, temp)
 
-    p_col, mask_col = to_col_major(p_row, mask, B, n1)
-    ref = make_loss_fn(temp, B).calculate_loss(make_reps(q, p_col, B, n1), mask_col)
+    # p_all layout: p_all[0:B]=positives, p_all[B:M]=negatives by column -> col-major
+    repo_mask = gold_to_repo_mask(gold_mask)
+    ref = make_loss_fn(temp, B).calculate_loss(make_reps(q, p_all, B, n1), repo_mask)
 
     assert torch.allclose(our, ref, atol=1e-5), f"ours={our:.6f}  repo={ref:.6f}"
     print(f"PASS test_end_to_end_loss_matches_repo          loss={our:.6f}")
@@ -334,8 +330,8 @@ if __name__ == "__main__":
     test_cached_gradients_match_reference()
     # Collate unit tests
     test_collate_output_shapes()
-    test_collate_mask_shared_positive()
-    test_collate_mask_no_false_negatives()
+    test_collate_mask_shared_goal()
+    test_collate_mask_distinct_goals()
     test_collate_draft_labels()
     test_collate_retrieval_query_ends_with_emb()
     # Integration
